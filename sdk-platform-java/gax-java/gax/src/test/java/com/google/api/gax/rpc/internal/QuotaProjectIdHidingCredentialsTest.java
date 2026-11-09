@@ -31,16 +31,22 @@ package com.google.api.gax.rpc.internal;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
 import com.google.auth.Credentials;
+import com.google.auth.RequestMetadataCallback;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.util.concurrent.MoreExecutors;
 import java.io.IOException;
+import java.net.URI;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
@@ -116,5 +122,76 @@ class QuotaProjectIdHidingCredentialsTest {
         new QuotaProjectIdHidingCredentials(credentials);
 
     assertEquals(quotaProjectIdHidingCredentials.getUniverseDomain(), "example.com");
+  }
+
+  @Test
+  void quotaProjectIdHidingCredentials_asyncGetRequestMetadataStripsHeaderAndPropagatesFailure() {
+    Map<String, List<String>> metaDataWithQuota =
+        ImmutableMap.of(
+            "Authorization",
+            Collections.singletonList("Bearer token"),
+            "X-Goog-User-Project",
+            Collections.singletonList(QUOTA_PROJECT_ID_FROM_CREDENTIALS_VALUE));
+    Credentials delegate =
+        mock(GoogleCredentials.class, Mockito.withSettings().withoutAnnotations());
+    Mockito.doAnswer(
+            inv -> {
+              RequestMetadataCallback cb = inv.getArgument(2);
+              cb.onSuccess(metaDataWithQuota);
+              return null;
+            })
+        .when(delegate)
+        .getRequestMetadata(
+            Mockito.any(), Mockito.any(Executor.class), Mockito.any(RequestMetadataCallback.class));
+
+    QuotaProjectIdHidingCredentials hiding = new QuotaProjectIdHidingCredentials(delegate);
+    AtomicReference<Map<String, List<String>>> captured = new AtomicReference<>();
+    hiding.getRequestMetadata(
+        URI.create("https://storage.googleapis.com"),
+        MoreExecutors.directExecutor(),
+        new RequestMetadataCallback() {
+          @Override
+          public void onSuccess(Map<String, List<String>> metadata) {
+            captured.set(metadata);
+          }
+
+          @Override
+          public void onFailure(Throwable exception) {
+            throw new AssertionError(exception);
+          }
+        });
+
+    assertEquals(
+        ImmutableMap.of("Authorization", Collections.singletonList("Bearer token")),
+        captured.get());
+
+    IOException failure = new IOException("refresh failed");
+    Mockito.doAnswer(
+            inv -> {
+              RequestMetadataCallback cb = inv.getArgument(2);
+              cb.onFailure(failure);
+              return null;
+            })
+        .when(delegate)
+        .getRequestMetadata(
+            Mockito.any(), Mockito.any(Executor.class), Mockito.any(RequestMetadataCallback.class));
+
+    AtomicReference<Throwable> capturedError = new AtomicReference<>();
+    hiding.getRequestMetadata(
+        URI.create("https://storage.googleapis.com"),
+        MoreExecutors.directExecutor(),
+        new RequestMetadataCallback() {
+          @Override
+          public void onSuccess(Map<String, List<String>> metadata) {
+            throw new AssertionError("Expected failure");
+          }
+
+          @Override
+          public void onFailure(Throwable exception) {
+            capturedError.set(exception);
+          }
+        });
+
+    assertSame(failure, capturedError.get());
   }
 }

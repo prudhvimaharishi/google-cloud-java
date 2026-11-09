@@ -69,6 +69,8 @@ import io.grpc.auth.MoreCallCredentials;
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Method;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
@@ -153,9 +155,12 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
   private final @Nullable Boolean keepAliveWithoutCalls;
   private final ChannelPoolSettings channelPoolSettings;
   private final @Nullable Credentials credentials;
+  private final @Nullable Credentials altsCredentials;
   private final @Nullable CallCredentials altsCallCredentials;
+  private final @Nullable Credentials mtlsS2ACredentials;
   private final @Nullable CallCredentials mtlsS2ACallCredentials;
   private final @Nullable ChannelPrimer channelPrimer;
+  private final boolean warmUpOnCreation;
   private final @Nullable Boolean attemptDirectPath;
   private final @Nullable Boolean attemptDirectPathXds;
   private final @Nullable Boolean attemptDirectPathXdsOverInterconnect;
@@ -237,9 +242,12 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
     this.channelPoolSettings = builder.channelPoolSettings;
     this.channelConfigurator = builder.channelConfigurator;
     this.credentials = builder.credentials;
+    this.altsCredentials = builder.altsCredentials;
     this.altsCallCredentials = builder.altsCallCredentials;
+    this.mtlsS2ACredentials = builder.mtlsS2ACredentials;
     this.mtlsS2ACallCredentials = builder.mtlsS2ACallCredentials;
     this.channelPrimer = builder.channelPrimer;
+    this.warmUpOnCreation = builder.warmUpOnCreation;
     this.attemptDirectPath = builder.attemptDirectPath;
     this.attemptDirectPathXds = builder.attemptDirectPathXds;
     this.attemptDirectPathXdsOverInterconnect = builder.attemptDirectPathXdsOverInterconnect;
@@ -411,19 +419,64 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
     // it, mirroring the credential selection in createSingleChannel(): DirectPath channels use
     // GoogleDefaultChannelCredentials (ALTS) rather than the client certificate, and without an
     // mtlsProvider there is no client certificate KeyStore (S2A or plain TLS is used instead).
+    boolean directPathActive = this.canUseDirectPath();
     String workloadCertPath =
-        !this.canUseDirectPath() && mtlsProvider != null
+        !directPathActive && mtlsProvider != null
             ? certificateBasedAccess.getWorkloadCertPath()
             : null;
+    ChannelPool pool =
+        ChannelPool.create(
+            channelPoolSettings,
+            InstantiatingGrpcChannelProvider.this::createSingleChannel,
+            backgroundExecutor,
+            workloadCertPath);
+    ChannelWarmUp channelWarmUp =
+        new ChannelWarmUp(
+            pool,
+            resolveActiveCredentials(directPathActive),
+            getMetadataUri(),
+            pool.getBackgroundExecutor());
+    if (warmUpOnCreation) {
+      channelWarmUp.startInBackground();
+    }
     return GrpcTransportChannel.newBuilder()
-        .setManagedChannel(
-            ChannelPool.create(
-                channelPoolSettings,
-                InstantiatingGrpcChannelProvider.this::createSingleChannel,
-                backgroundExecutor,
-                workloadCertPath))
-        .setDirectPath(this.canUseDirectPath())
+        .setManagedChannel(pool)
+        .setChannelWarmUp(channelWarmUp)
+        .setDirectPath(directPathActive)
         .build();
+  }
+
+  @VisibleForTesting
+  @Nullable Credentials resolveActiveCredentials() {
+    return resolveActiveCredentials(this.canUseDirectPath());
+  }
+
+  private @Nullable Credentials resolveActiveCredentials(boolean directPathActive) {
+    if (directPathActive) {
+      return altsCredentials != null ? altsCredentials : credentials;
+    }
+    if (useS2A && mtlsS2ACredentials != null) {
+      return mtlsS2ACredentials;
+    }
+    return credentials;
+  }
+
+  @VisibleForTesting
+  @Nullable URI getMetadataUri() {
+    if (endpoint == null) {
+      return null;
+    }
+    int colon = endpoint.lastIndexOf(':');
+    if (colon < 0) {
+      return null;
+    }
+    String host = endpoint.substring(0, colon);
+    int port = Integer.parseInt(endpoint.substring(colon + 1));
+    try {
+      return new URI("https", null, host, port == 443 ? -1 : port, null, null, null);
+    } catch (URISyntaxException e) {
+      return null;
+    }
   }
 
   private boolean isDirectPathEnabled() {
@@ -889,6 +942,9 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
     ManagedChannelBuilder<?> builder = createDecoratedChannelBuilder();
 
     ManagedChannel managedChannel = builder.build();
+    if (warmUpOnCreation) {
+      ChannelWarmUp.requestConnection(managedChannel);
+    }
     if (channelPrimer != null) {
       channelPrimer.primeChannel(managedChannel);
     }
@@ -984,6 +1040,12 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
     return channelPoolSettings;
   }
 
+  /** Whether channel connection and credential prefetching run automatically on creation. */
+  @InternalApi("For internal use by google-cloud-java clients only")
+  public boolean isWarmUpOnCreation() {
+    return warmUpOnCreation;
+  }
+
   /** Gets the background executor for channel refresh and resize. */
   ScheduledExecutorService getBackgroundExecutor() {
     return backgroundExecutor;
@@ -1022,9 +1084,12 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
     private @Nullable Boolean keepAliveWithoutCalls;
     private @Nullable ApiFunction<ManagedChannelBuilder, ManagedChannelBuilder> channelConfigurator;
     private @Nullable Credentials credentials;
+    private @Nullable Credentials altsCredentials;
     private @Nullable CallCredentials altsCallCredentials;
+    private @Nullable Credentials mtlsS2ACredentials;
     private @Nullable CallCredentials mtlsS2ACallCredentials;
     private @Nullable ChannelPrimer channelPrimer;
+    private boolean warmUpOnCreation = false;
     private ChannelPoolSettings channelPoolSettings;
     private @Nullable Boolean attemptDirectPath;
     private @Nullable Boolean attemptDirectPathXds;
@@ -1056,9 +1121,12 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
       this.keepAliveWithoutCalls = provider.keepAliveWithoutCalls;
       this.channelConfigurator = provider.channelConfigurator;
       this.credentials = provider.credentials;
+      this.altsCredentials = provider.altsCredentials;
       this.altsCallCredentials = provider.altsCallCredentials;
+      this.mtlsS2ACredentials = provider.mtlsS2ACredentials;
       this.mtlsS2ACallCredentials = provider.mtlsS2ACallCredentials;
       this.channelPrimer = provider.channelPrimer;
+      this.warmUpOnCreation = provider.warmUpOnCreation;
       this.channelPoolSettings = provider.channelPoolSettings;
       this.attemptDirectPath = provider.attemptDirectPath;
       this.attemptDirectPathXds = provider.attemptDirectPathXds;
@@ -1349,6 +1417,21 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
       return this;
     }
 
+    /**
+     * Enables or disables non-blocking channel connection initiation and credential token
+     * prefetching when the transport channel is created.
+     */
+    @InternalApi("For internal use by google-cloud-java clients only")
+    public Builder setWarmUpOnCreation(boolean warmUpOnCreation) {
+      this.warmUpOnCreation = warmUpOnCreation;
+      return this;
+    }
+
+    @InternalApi("For internal use by google-cloud-java clients only")
+    public boolean isWarmUpOnCreation() {
+      return warmUpOnCreation;
+    }
+
     /** Whether attempt DirectPath. */
     @InternalApi("For internal use by google-cloud-java clients only")
     public Builder setAttemptDirectPath(boolean attemptDirectPath) {
@@ -1439,7 +1522,7 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
           .anyMatch(val -> val.equals(HardBoundTokenTypes.ALTS));
     }
 
-    CallCredentials createHardBoundTokensCallCredentials(
+    ComputeEngineCredentials createHardBoundTokenCredentials(
         ComputeEngineCredentials.GoogleAuthTransport googleAuthTransport,
         ComputeEngineCredentials.@Nullable BindingEnforcement bindingEnforcement) {
       ComputeEngineCredentials.Builder credsBuilder =
@@ -1452,13 +1535,19 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
       // access token held by {@code credentials}; we want this new credential to fetch a new access
       // token
       // from MDS using the {@param googleAuthTransport} and {@param bindingEnforcement}.
+      return ComputeEngineCredentials.newBuilder()
+          .setScopes(credsBuilder.getScopes())
+          .setHttpTransportFactory(credsBuilder.getHttpTransportFactory())
+          .setGoogleAuthTransport(googleAuthTransport)
+          .setBindingEnforcement(bindingEnforcement)
+          .build();
+    }
+
+    CallCredentials createHardBoundTokensCallCredentials(
+        ComputeEngineCredentials.GoogleAuthTransport googleAuthTransport,
+        ComputeEngineCredentials.@Nullable BindingEnforcement bindingEnforcement) {
       return MoreCallCredentials.from(
-          ComputeEngineCredentials.newBuilder()
-              .setScopes(credsBuilder.getScopes())
-              .setHttpTransportFactory(credsBuilder.getHttpTransportFactory())
-              .setGoogleAuthTransport(googleAuthTransport)
-              .setBindingEnforcement(bindingEnforcement)
-              .build());
+          createHardBoundTokenCredentials(googleAuthTransport, bindingEnforcement));
     }
 
     public InstantiatingGrpcChannelProvider build() {
@@ -1493,15 +1582,25 @@ public final class InstantiatingGrpcChannelProvider implements TransportChannelP
       if (isMtlsS2AHardBoundTokensEnabled()) {
         // Set a {@code ComputeEngineCredentials} instance to be per-RPC call credentials,
         // which will be used to fetch MTLS_S2A hard bound tokens from the metdata server.
-        this.mtlsS2ACallCredentials =
-            createHardBoundTokensCallCredentials(
+        ComputeEngineCredentials mtlsCreds =
+            createHardBoundTokenCredentials(
                 ComputeEngineCredentials.GoogleAuthTransport.MTLS,
                 ComputeEngineCredentials.BindingEnforcement.ON);
+        this.mtlsS2ACredentials = mtlsCreds;
+        this.mtlsS2ACallCredentials = MoreCallCredentials.from(mtlsCreds);
+      } else {
+        this.mtlsS2ACredentials = null;
+        this.mtlsS2ACallCredentials = null;
       }
       if (isDirectPathBoundTokenEnabled()) {
-        this.altsCallCredentials =
-            createHardBoundTokensCallCredentials(
+        ComputeEngineCredentials altsCreds =
+            createHardBoundTokenCredentials(
                 ComputeEngineCredentials.GoogleAuthTransport.ALTS, null);
+        this.altsCredentials = altsCreds;
+        this.altsCallCredentials = MoreCallCredentials.from(altsCreds);
+      } else {
+        this.altsCredentials = null;
+        this.altsCallCredentials = null;
       }
       InstantiatingGrpcChannelProvider instantiatingGrpcChannelProvider =
           new InstantiatingGrpcChannelProvider(this);
