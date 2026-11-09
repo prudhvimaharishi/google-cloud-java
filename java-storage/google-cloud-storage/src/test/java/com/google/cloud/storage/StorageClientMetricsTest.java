@@ -46,7 +46,9 @@ public final class StorageClientMetricsTest {
           StorageClientMetrics::getErrors,
           StorageClientMetrics::getTtfb,
           StorageClientMetrics::getRequestBodySize,
-          StorageClientMetrics::getResponseBodySize);
+          StorageClientMetrics::getResponseBodySize,
+          StorageClientMetrics::getWarmupDuration,
+          StorageClientMetrics::getWarmupOperations);
 
   private static final List<Function<StorageClientMetrics, Object>> DEBUG_INSTRUMENTS =
       ImmutableList.of(
@@ -140,6 +142,8 @@ public final class StorageClientMetricsTest {
     metrics.getOperations().add(1);
     metrics.getAttempts().add(2);
     metrics.getErrors().add(1);
+    metrics.getWarmupDuration().record(0.015);
+    metrics.getWarmupOperations().add(1);
     metrics.getRequestActive().add(1);
     metrics.getServerUnreached().add(1);
 
@@ -167,6 +171,10 @@ public final class StorageClientMetricsTest {
         expectedLatencyBoundaries);
     assertHistogramBoundaries(
         metricsMap, StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_TTFB, expectedLatencyBoundaries);
+    assertHistogramBoundaries(
+        metricsMap,
+        StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_WARMUP_DURATION,
+        expectedLatencyBoundaries);
 
     // Verify debug latency histograms have custom latency boundaries and slash names
     assertHistogramBoundaries(
@@ -205,6 +213,11 @@ public final class StorageClientMetricsTest {
     String errorsName = StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_ERRORS.replace(".", "/");
     assertThat(metricsMap).containsKey(errorsName);
     assertThat(metricsMap.get(errorsName).getUnit()).isEqualTo("{error}");
+
+    String warmupOperationsName =
+        StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_WARMUP_OPERATIONS.replace(".", "/");
+    assertThat(metricsMap).containsKey(warmupOperationsName);
+    assertThat(metricsMap.get(warmupOperationsName).getUnit()).isEqualTo("{operation}");
 
     String requestActiveName =
         StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_REQUEST_ACTIVE.replace(".", "/");

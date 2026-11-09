@@ -1012,12 +1012,29 @@ public final class GrpcStorageOptions extends StorageOptions
 
           ScheduledExecutorService executor =
               storageSettings.getBackgroundExecutorProvider().getExecutor();
+          ResultRetryAlgorithm<?> dataRetryAlgorithm =
+              new ReadObjectRangeResultRetryAlgorithmDecorator(
+                  grpcStorageOptions.getRetryAlgorithmManager().idempotent());
           RetryContextProvider retryContextProvider =
+              RetryContext.providerFrom(executor, grpcStorageOptions, dataRetryAlgorithm);
+          Duration configuredTotalTimeout =
+              grpcStorageOptions.getRetrySettings().getTotalTimeoutDuration();
+          Duration warmUpTimeout =
+              configuredTotalTimeout != null
+                      && !configuredTotalTimeout.isZero()
+                      && configuredTotalTimeout.compareTo(StorageDataClient.MAX_WARMUP_TIMEOUT) < 0
+                  ? configuredTotalTimeout
+                  : StorageDataClient.MAX_WARMUP_TIMEOUT;
+          RetrySettings warmUpRetrySettings =
+              grpcStorageOptions.getRetrySettings().toBuilder()
+                  .setLogicalTimeout(warmUpTimeout)
+                  .build();
+          RetryContextProvider warmUpRetryContextProvider =
               RetryContext.providerFrom(
                   executor,
-                  grpcStorageOptions,
-                  new ReadObjectRangeResultRetryAlgorithmDecorator(
-                      grpcStorageOptions.getRetryAlgorithmManager().idempotent()));
+                  Retrying.RetryingDependencies.simple(
+                      grpcStorageOptions.getClock(), warmUpRetrySettings),
+                  dataRetryAlgorithm);
 
           OpenTelemetry otel = options.getOpenTelemetry();
           DefaultRetrier retrier =
@@ -1043,6 +1060,8 @@ public final class GrpcStorageOptions extends StorageOptions
                     new ZeroCopyBidiStreamingCallable<>(
                         stub.bidiReadObjectCallable(), stub.bidiReadObjectResponseMarshaller),
                     retryContextProvider,
+                    warmUpRetryContextProvider,
+                    warmUpTimeout,
                     IOAutoCloseable.noOp());
             GrpcStorageImpl grpcStorage =
                 new GrpcStorageImpl(
@@ -1076,6 +1095,8 @@ public final class GrpcStorageOptions extends StorageOptions
                         client.bidiReadObjectCallable(),
                         ResponseContentLifecycleManager.noopBidiReadObjectResponse()),
                     retryContextProvider,
+                    warmUpRetryContextProvider,
+                    warmUpTimeout,
                     IOAutoCloseable.noOp());
             GrpcStorageImpl grpcStorage =
                 new GrpcStorageImpl(

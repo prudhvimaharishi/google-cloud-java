@@ -215,6 +215,7 @@ final class OpenTelemetryBootstrappingUtils {
           StorageClientMetrics.METRIC_HTTP_CLIENT_REQUEST_DURATION,
           StorageClientMetrics.METRIC_GCP_CLIENT_REQUEST_DURATION,
           StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_TTFB,
+          StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_WARMUP_DURATION,
           StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_SERVER_DURATION,
           StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_STALL_DURATION,
           StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_AUTH_CREDENTIAL_REFRESH_DURATION);
@@ -229,6 +230,7 @@ final class OpenTelemetryBootstrappingUtils {
           StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_OPERATIONS,
           StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_ATTEMPTS,
           StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_ERRORS,
+          StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_WARMUP_OPERATIONS,
           StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_REQUEST_ACTIVE,
           StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_SERVER_UNREACHED,
           StorageClientMetrics.METRIC_GCP_STORAGE_CLIENT_NETWORK_IO);

@@ -27,9 +27,11 @@ import static com.google.cloud.storage.Utils.bucketNameCodec;
 import static com.google.cloud.storage.Utils.ifNonNull;
 import static com.google.cloud.storage.Utils.projectNameCodec;
 import static com.google.common.base.MoreObjects.firstNonNull;
+import static com.google.common.base.Preconditions.checkArgument;
 import static java.util.Objects.requireNonNull;
 
 import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutureCallback;
 import com.google.api.core.ApiFutures;
 import com.google.api.core.BetaApi;
 import com.google.api.core.SettableApiFuture;
@@ -44,6 +46,7 @@ import com.google.api.gax.rpc.ClientStreamingCallable;
 import com.google.api.gax.rpc.NotFoundException;
 import com.google.api.gax.rpc.UnaryCallable;
 import com.google.cloud.BaseService;
+import com.google.cloud.BaseServiceException;
 import com.google.cloud.Policy;
 import com.google.cloud.WriteChannel;
 import com.google.cloud.storage.Acl.Entity;
@@ -59,6 +62,7 @@ import com.google.cloud.storage.PostPolicyV4.PostFieldsV4;
 import com.google.cloud.storage.Retrying.Retrier;
 import com.google.cloud.storage.Retrying.RetrierWithAlg;
 import com.google.cloud.storage.Storage.ComposeRequest.SourceBlob;
+import com.google.cloud.storage.StorageDataClient.WarmUpProbeOutcome;
 import com.google.cloud.storage.UnbufferedReadableByteChannelSession.UnbufferedReadableByteChannel;
 import com.google.cloud.storage.UnbufferedWritableByteChannelSession.UnbufferedWritableByteChannel;
 import com.google.cloud.storage.UnifiedOpts.BucketListOpt;
@@ -113,6 +117,11 @@ import com.google.storage.v2.UpdateObjectRequest;
 import com.google.storage.v2.WriteObjectRequest;
 import com.google.storage.v2.WriteObjectResponse;
 import com.google.storage.v2.WriteObjectSpec;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.metrics.DoubleHistogram;
+import io.opentelemetry.api.metrics.LongCounter;
+import io.opentelemetry.api.metrics.MeterProvider;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -178,6 +187,7 @@ final class GrpcStorageImpl extends BaseService<StorageOptions>
   final SyntaxDecoders syntaxDecoders;
   final Retrier retrier;
   final @Nullable GrpcTransportChannel transportChannel;
+  final @Nullable StorageClientMetrics clientMetrics;
 
   // workaround for https://github.com/googleapis/java-storage/issues/1736
   private final Opts<UserProject> defaultOpts;
@@ -219,10 +229,29 @@ final class GrpcStorageImpl extends BaseService<StorageOptions>
     this.retrier = retrier;
     this.defaultOpts = defaultOpts;
     this.transportChannel = transportChannel;
+    this.clientMetrics = createClientMetrics(options);
     this.codecs = Conversions.grpc();
     this.retryAlgorithmManager = options.getRetryAlgorithmManager();
     this.syntaxDecoders = new SyntaxDecoders();
     this.defaultProjectId = Suppliers.memoize(() -> UnifiedOpts.projectId(options.getProjectId()));
+  }
+
+  private static @Nullable StorageClientMetrics createClientMetrics(GrpcStorageOptions options) {
+    if (!options.isEnableOtelMetrics()) {
+      return null;
+    }
+    MeterProvider meterProvider = options.getMeterProvider();
+    if (meterProvider == null) {
+      OpenTelemetry otel = options.getOpenTelemetry();
+      if (otel != null && otel != OpenTelemetry.noop()) {
+        meterProvider = otel.getMeterProvider();
+      }
+    }
+    if (meterProvider == null) {
+      return null;
+    }
+    return StorageClientMetrics.create(
+        meterProvider, options.isEnableOtelMetrics(), options.isEnableOtelDebugMetrics());
   }
 
   @Override
@@ -1510,6 +1539,122 @@ final class GrpcStorageImpl extends BaseService<StorageOptions>
     ApiFuture<ObjectReadSession> session = storageDataClient.readSession(req, context);
 
     return BlobReadSessionAdapter.wrap(session);
+  }
+
+  @BetaApi
+  @Override
+  public ApiFuture<Void> warmUp() {
+    long startNanos = getOptions().getClock().nanoTime();
+    if (transportChannel == null) {
+      recordWarmUpMetrics(startNanos, StorageErrorTypeMapper.STATUS_OK);
+      return ApiFutures.immediateFuture(null);
+    }
+    SettableApiFuture<Void> resultFuture = SettableApiFuture.create();
+    ApiFuture<Void> rawFuture = transportChannel.warmUp();
+    resultFuture.addListener(
+        () -> {
+          if (resultFuture.isCancelled()) {
+            rawFuture.cancel(true);
+          }
+        },
+        MoreExecutors.directExecutor());
+    ApiFutures.addCallback(
+        rawFuture,
+        new ApiFutureCallback<Void>() {
+          @Override
+          public void onSuccess(Void result) {
+            recordWarmUpMetrics(startNanos, StorageErrorTypeMapper.STATUS_OK);
+            resultFuture.set(null);
+          }
+
+          @Override
+          public void onFailure(Throwable t) {
+            BaseServiceException coalesced = StorageException.coalesce(t);
+            recordWarmUpMetrics(startNanos, StorageErrorTypeMapper.mapThrowable(coalesced));
+            resultFuture.setException(coalesced);
+          }
+        },
+        MoreExecutors.directExecutor());
+    return resultFuture;
+  }
+
+  @BetaApi
+  @Override
+  public ApiFuture<Void> warmUp(String bucket, BucketSourceOption... options) {
+    requireNonNull(bucket, "bucket must be non null");
+    checkArgument(!bucket.isEmpty(), "bucket must be non-empty");
+    requireNonNull(options, "options must be non null");
+
+    long startNanos = getOptions().getClock().nanoTime();
+    if (transportChannel != null) {
+      transportChannel.startWarmUp();
+    }
+
+    Opts<BucketSourceOpt> opts = Opts.unwrap(options).prepend(defaultOpts);
+    GrpcCallContext context = opts.grpcMetadataMapper().apply(GrpcCallContext.createDefault());
+    BidiReadObjectRequest req =
+        BidiReadObjectRequest.newBuilder()
+            .setReadObjectSpec(
+                BidiReadObjectSpec.newBuilder()
+                    .setBucket(bucketNameCodec.encode(bucket))
+                    .setObject(StorageDataClient.WARMUP_NONEXISTENT_OBJECT)
+                    .setGeneration(StorageDataClient.WARMUP_OBJECT_GENERATION)
+                    .build())
+            .build();
+
+    SettableApiFuture<Void> resultFuture = SettableApiFuture.create();
+    ApiFuture<WarmUpProbeOutcome> probeFuture = storageDataClient.warmUp(req, context);
+    resultFuture.addListener(
+        () -> {
+          if (resultFuture.isCancelled()) {
+            probeFuture.cancel(true);
+          }
+        },
+        MoreExecutors.directExecutor());
+    ApiFutures.addCallback(
+        probeFuture,
+        new ApiFutureCallback<WarmUpProbeOutcome>() {
+          @Override
+          public void onSuccess(WarmUpProbeOutcome outcome) {
+            String outcomeLabel =
+                outcome == WarmUpProbeOutcome.NOT_FOUND
+                    ? StorageErrorTypeMapper.STATUS_NOT_FOUND
+                    : StorageErrorTypeMapper.STATUS_OK;
+            recordWarmUpMetrics(startNanos, outcomeLabel);
+            resultFuture.set(null);
+          }
+
+          @Override
+          public void onFailure(Throwable t) {
+            BaseServiceException coalesced = StorageException.coalesce(t);
+            recordWarmUpMetrics(startNanos, StorageErrorTypeMapper.mapThrowable(coalesced));
+            resultFuture.setException(coalesced);
+          }
+        },
+        MoreExecutors.directExecutor());
+    return resultFuture;
+  }
+
+  private void recordWarmUpMetrics(long startNanos, String outcome) {
+    if (clientMetrics == null) {
+      return;
+    }
+    double durationSeconds =
+        Math.max(0L, getOptions().getClock().nanoTime() - startNanos) / 1_000_000_000.0;
+    Attributes attrs =
+        clientMetrics
+            .clientAttributesBuilder()
+            .put(StorageClientMetrics.KEY_GCP_CLIENT_METHOD, "Storage.warmUp")
+            .put(StorageClientMetrics.KEY_GCP_STORAGE_WARMUP_OUTCOME, outcome)
+            .build();
+    LongCounter warmupOperations = clientMetrics.getWarmupOperations();
+    if (warmupOperations != null) {
+      warmupOperations.add(1, attrs);
+    }
+    DoubleHistogram warmupDuration = clientMetrics.getWarmupDuration();
+    if (warmupDuration != null) {
+      warmupDuration.record(durationSeconds, attrs);
+    }
   }
 
   @Override

@@ -61,6 +61,8 @@ final class StorageClientMetrics {
   static final AttributeKey<String> KEY_NETWORK_PATH = AttributeKey.stringKey("network.path");
   static final AttributeKey<String> KEY_NETWORK_IO_DIRECTION =
       AttributeKey.stringKey("network.io.direction");
+  static final AttributeKey<String> KEY_GCP_STORAGE_WARMUP_OUTCOME =
+      AttributeKey.stringKey("gcp.storage.warmup.outcome");
 
   static final String NETWORK_PATH_DIRECTPATH = "directpath";
   static final String NETWORK_PATH_CLOUDPATH = "cloudpath";
@@ -89,6 +91,10 @@ final class StorageClientMetrics {
       "gcp.storage.client.request.body.size";
   static final String METRIC_GCP_STORAGE_CLIENT_RESPONSE_BODY_SIZE =
       "gcp.storage.client.response.body.size";
+  static final String METRIC_GCP_STORAGE_CLIENT_WARMUP_DURATION =
+      "gcp.storage.client.warmup.duration";
+  static final String METRIC_GCP_STORAGE_CLIENT_WARMUP_OPERATIONS =
+      "gcp.storage.client.warmup.operations";
 
   // Debug metric names
   static final String METRIC_GCP_STORAGE_CLIENT_REQUEST_ACTIVE =
@@ -112,6 +118,8 @@ final class StorageClientMetrics {
   @Nullable private final DoubleHistogram ttfb;
   @Nullable private final LongHistogram requestBodySize;
   @Nullable private final LongHistogram responseBodySize;
+  @Nullable private final DoubleHistogram warmupDuration;
+  @Nullable private final LongCounter warmupOperations;
 
   @Nullable private final LongUpDownCounter requestActive;
   @Nullable private final DoubleHistogram serverDuration;
@@ -246,6 +254,20 @@ final class StorageClientMetrics {
               .setExplicitBucketBoundariesAdvice(
                   OpenTelemetryBootstrappingUtils.sizeHistogramLongBoundaries())
               .build();
+      this.warmupDuration =
+          meter
+              .histogramBuilder(METRIC_GCP_STORAGE_CLIENT_WARMUP_DURATION)
+              .setDescription("Latency of a client warm-up operation.")
+              .setUnit("s")
+              .setExplicitBucketBoundariesAdvice(
+                  OpenTelemetryBootstrappingUtils.latencyHistogramBoundaries())
+              .build();
+      this.warmupOperations =
+          meter
+              .counterBuilder(METRIC_GCP_STORAGE_CLIENT_WARMUP_OPERATIONS)
+              .setDescription("Number of GCS client warm-up operations, by outcome.")
+              .setUnit("{operation}")
+              .build();
     } else {
       this.rpcClientCallDuration = null;
       this.httpClientRequestDuration = null;
@@ -256,6 +278,8 @@ final class StorageClientMetrics {
       this.ttfb = null;
       this.requestBodySize = null;
       this.responseBodySize = null;
+      this.warmupDuration = null;
+      this.warmupOperations = null;
     }
 
     if (enableOtelDebugMetrics) {
@@ -371,6 +395,14 @@ final class StorageClientMetrics {
 
   @Nullable LongHistogram getResponseBodySize() {
     return responseBodySize;
+  }
+
+  @Nullable DoubleHistogram getWarmupDuration() {
+    return warmupDuration;
+  }
+
+  @Nullable LongCounter getWarmupOperations() {
+    return warmupOperations;
   }
 
   @Nullable LongUpDownCounter getRequestActive() {
