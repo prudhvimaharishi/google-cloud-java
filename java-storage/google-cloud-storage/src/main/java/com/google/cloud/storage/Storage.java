@@ -6027,21 +6027,19 @@ public interface Storage extends Service<StorageOptions>, AutoCloseable {
    * Warms the client's transport channels, authentication credentials, and data-plane routing path
    * for the specified {@code bucket}.
    *
-   * <p>On gRPC transport clients, this method sends a lightweight {@code BidiReadObject} probe for
-   * a reserved nonexistent object ({@code __gcs_sdk_warmup_nonexistent_object__}) with zero read
-   * ranges. An expected {@code NOT_FOUND} reply confirms that transport setup, authentication, and
-   * bucket routing succeeded and resolves the returned future normally.
+   * <p>On gRPC transport clients, this method performs a best-effort, non-mutating read probe
+   * against {@code bucket} so that transport setup, authentication, and bucket routing complete
+   * before application reads begin.
    *
    * <p>Operational notes:
    *
    * <ul>
    *   <li>Requires {@code storage.objects.get} permission on {@code bucket} without object-prefix
    *       IAM conditions.
-   *   <li>Counts as one Class B read operation and produces one Data Access audit log entry if Data
-   *       Read audit logging is enabled on {@code bucket}.
-   *   <li>Google Cloud Storage returns {@code NOT_FOUND} both when the probe object is absent in an
-   *       existing bucket and when {@code bucket} itself does not exist, so verify the bucket name
-   *       to ensure the intended bucket route is warmed.
+   *   <li>May incur Class B read operation charges and produce Data Access audit log entries if
+   *       Data Read audit logging is enabled on {@code bucket}.
+   *   <li>Success does not imply that {@code bucket} exists; do not use this method as a bucket
+   *       existence check.
    *   <li>Supports {@link BucketSourceOption#userProject(String)} for Requester Pays buckets.
    *   <li>On HTTP transport clients, this method validates {@code bucket} and returns an
    *       immediately completed future without network I/O.
@@ -6050,7 +6048,7 @@ public interface Storage extends Service<StorageOptions>, AutoCloseable {
    * @param bucket non-empty name of the target bucket to warm
    * @param options optional bucket source options such as {@link
    *     BucketSourceOption#userProject(String)}
-   * @return a future that completes when the warm-up probe finishes, or fails with a {@link
+   * @return a future that completes when the warm-up finishes, or fails with a {@link
    *     StorageException} on authentication, permission, or transport failure
    */
   @BetaApi
