@@ -34,6 +34,7 @@ import com.google.api.core.ApiFutures;
 import com.google.api.core.BetaApi;
 import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.grpc.GrpcCallContext;
+import com.google.api.gax.grpc.GrpcTransportChannel;
 import com.google.api.gax.paging.AbstractPage;
 import com.google.api.gax.paging.Page;
 import com.google.api.gax.retrying.ResultRetryAlgorithm;
@@ -176,6 +177,7 @@ final class GrpcStorageImpl extends BaseService<StorageOptions>
   final GrpcRetryAlgorithmManager retryAlgorithmManager;
   final SyntaxDecoders syntaxDecoders;
   final Retrier retrier;
+  final @Nullable GrpcTransportChannel transportChannel;
 
   // workaround for https://github.com/googleapis/java-storage/issues/1736
   private final Opts<UserProject> defaultOpts;
@@ -189,6 +191,26 @@ final class GrpcStorageImpl extends BaseService<StorageOptions>
       WriterFactory writerFactory,
       Retrier retrier,
       Opts<UserProject> defaultOpts) {
+    this(
+        options,
+        storageClient,
+        storageDataClient,
+        responseContentLifecycleManager,
+        writerFactory,
+        retrier,
+        defaultOpts,
+        null);
+  }
+
+  GrpcStorageImpl(
+      GrpcStorageOptions options,
+      StorageClient storageClient,
+      StorageDataClient storageDataClient,
+      ResponseContentLifecycleManager<ReadObjectResponse> responseContentLifecycleManager,
+      WriterFactory writerFactory,
+      Retrier retrier,
+      Opts<UserProject> defaultOpts,
+      @Nullable GrpcTransportChannel transportChannel) {
     super(options);
     this.storageClient = storageClient;
     this.storageDataClient = storageDataClient;
@@ -196,6 +218,7 @@ final class GrpcStorageImpl extends BaseService<StorageOptions>
     this.writerFactory = writerFactory;
     this.retrier = retrier;
     this.defaultOpts = defaultOpts;
+    this.transportChannel = transportChannel;
     this.codecs = Conversions.grpc();
     this.retryAlgorithmManager = options.getRetryAlgorithmManager();
     this.syntaxDecoders = new SyntaxDecoders();

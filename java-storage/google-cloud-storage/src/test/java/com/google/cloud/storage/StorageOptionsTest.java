@@ -48,6 +48,7 @@ public final class StorageOptionsTest {
   @After
   public void tearDown() {
     StorageMetricsConfig.resetResolversForTesting();
+    StorageWarmUpConfig.resetResolversForTesting();
   }
 
   @Test
@@ -457,5 +458,42 @@ public final class StorageOptionsTest {
           assertThat(defaultOptions).isEqualTo(deserialized);
           assertThat(deserialized.hashCode()).isEqualTo(defaultOptions.hashCode());
         });
+  }
+
+  @Test
+  public void warmUpOnCreation_defaultDisabledAndPrecedence() throws Exception {
+    GrpcStorageOptions defaultOptions = GrpcStorageOptions.grpc().build();
+    assertThat(defaultOptions.isWarmUpOnCreationEnabled()).isFalse();
+
+    Map<String, String> sysProps = new HashMap<>();
+    Map<String, String> env = new HashMap<>();
+    StorageWarmUpConfig.setSysPropResolverForTesting(sysProps::get);
+    StorageWarmUpConfig.setEnvResolverForTesting(env::get);
+
+    env.put(StorageWarmUpConfig.ENV_ENABLE_WARMUP_ON_CREATION, "true");
+    assertThat(GrpcStorageOptions.grpc().build().isWarmUpOnCreationEnabled()).isTrue();
+
+    sysProps.put(StorageWarmUpConfig.SYS_PROP_WARMUP_ON_CREATION, "false");
+    assertThat(GrpcStorageOptions.grpc().build().isWarmUpOnCreationEnabled()).isFalse();
+
+    GrpcStorageOptions builderTrue =
+        GrpcStorageOptions.grpc().setWarmUpOnCreationEnabled(true).build();
+    assertThat(builderTrue.isWarmUpOnCreationEnabled()).isTrue();
+    GrpcStorageOptions rebuilt = builderTrue.toBuilder().build();
+    assertThat(rebuilt.isWarmUpOnCreationEnabled()).isTrue();
+    assertThat(rebuilt).isEqualTo(builderTrue);
+    assertThat(rebuilt.hashCode()).isEqualTo(builderTrue.hashCode());
+
+    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+    try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+      oos.writeObject(builderTrue);
+    }
+    GrpcStorageOptions deserialized;
+    try (ObjectInputStream ois =
+        new ObjectInputStream(new ByteArrayInputStream(baos.toByteArray()))) {
+      deserialized = (GrpcStorageOptions) ois.readObject();
+    }
+    assertThat(deserialized.isWarmUpOnCreationEnabled()).isTrue();
+    assertThat(deserialized).isEqualTo(builderTrue);
   }
 }

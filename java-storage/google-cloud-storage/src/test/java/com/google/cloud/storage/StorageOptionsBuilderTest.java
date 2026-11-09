@@ -128,6 +128,60 @@ public final class StorageOptionsBuilderTest {
     assertThat(grpcOptions.getUseJwtAccessWithScope()).isFalse();
   }
 
+  @Test
+  public void grpc_warmUpOnCreationPropagatesToChannelProvider() throws Exception {
+    GrpcStorageOptions defaultOptions =
+        GrpcStorageOptions.grpc()
+            .setCredentials(com.google.cloud.NoCredentials.getInstance())
+            .build();
+    com.google.api.gax.grpc.InstantiatingGrpcChannelProvider defaultProvider =
+        (com.google.api.gax.grpc.InstantiatingGrpcChannelProvider)
+            defaultOptions.getStorageSettings().getTransportChannelProvider();
+    assertThat(defaultProvider.isWarmUpOnCreation()).isFalse();
+
+    GrpcStorageOptions warmOptions =
+        defaultOptions.toBuilder().setWarmUpOnCreationEnabled(true).build();
+    com.google.api.gax.grpc.InstantiatingGrpcChannelProvider warmProvider =
+        (com.google.api.gax.grpc.InstantiatingGrpcChannelProvider)
+            warmOptions.getStorageSettings().getTransportChannelProvider();
+    assertThat(warmProvider.isWarmUpOnCreation()).isTrue();
+  }
+
+  @Test
+  public void grpc_quotaProjectInspectionDoesNotRefreshCredentialsSynchronously() throws Exception {
+    java.util.concurrent.atomic.AtomicInteger refreshCalls =
+        new java.util.concurrent.atomic.AtomicInteger();
+    com.google.auth.oauth2.GoogleCredentials blockingCreds =
+        com.google.auth.oauth2.GoogleCredentials.newBuilder()
+            .setQuotaProjectId("quota-proj-123")
+            .build();
+    com.google.auth.oauth2.GoogleCredentials spyCreds =
+        new com.google.auth.oauth2.GoogleCredentials(blockingCreds.toBuilder()) {
+          @Override
+          public com.google.auth.oauth2.AccessToken refreshAccessToken() {
+            refreshCalls.incrementAndGet();
+            throw new AssertionError("Synchronous refreshAccessToken called during client setup");
+          }
+        };
+
+    GrpcStorageOptions options =
+        GrpcStorageOptions.grpc()
+            .setHost("http://localhost:1")
+            .setAttemptDirectPath(false)
+            .setEnableGrpcClientMetrics(false)
+            .setCredentials(spyCreds)
+            .build();
+
+    com.google.storage.v2.StorageSettings settings = options.getStorageSettings();
+    assertThat(refreshCalls.get()).isEqualTo(0);
+    assertThat(settings.getCredentialsProvider().getCredentials())
+        .isInstanceOf(com.google.api.gax.rpc.internal.QuotaProjectIdHidingCredentials.class);
+
+    try (Storage ignored = options.getService()) {
+      assertThat(refreshCalls.get()).isEqualTo(0);
+    }
+  }
+
   private static class MyStorageRetryStrategy implements StorageRetryStrategy {
 
     @Override
