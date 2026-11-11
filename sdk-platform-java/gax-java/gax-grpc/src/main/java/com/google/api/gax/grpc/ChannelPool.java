@@ -29,12 +29,15 @@
  */
 package com.google.api.gax.grpc;
 
+import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutures;
 import com.google.api.core.InternalApi;
 import com.google.api.gax.core.FixedExecutorProvider;
 import com.google.api.gax.rpc.mtls.CertificateRotationTracker;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.MoreExecutors;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
@@ -194,6 +197,28 @@ class ChannelPool extends ManagedChannel {
 
   Channel getChannel(int affinity) {
     return new AffinityChannel(affinity);
+  }
+
+  ScheduledExecutorService getBackgroundExecutor() {
+    return backgroundExecutorProvider.getExecutor();
+  }
+
+  void requestConnections() {
+    List<Entry> localEntries = entries.get();
+    for (Entry entry : localEntries) {
+      ChannelWarmUp.requestConnection(entry.channel);
+    }
+  }
+
+  ApiFuture<Void> awaitReady(java.time.Duration timeout) {
+    List<Entry> localEntries = entries.get();
+    ScheduledExecutorService executor = backgroundExecutorProvider.getExecutor();
+    List<ApiFuture<Void>> readyFutures = new ArrayList<>(localEntries.size());
+    for (Entry entry : localEntries) {
+      readyFutures.add(ChannelWarmUp.awaitChannelReady(entry.channel, executor, timeout));
+    }
+    return ApiFutures.transform(
+        ApiFutures.allAsList(readyFutures), ignored -> null, MoreExecutors.directExecutor());
   }
 
   /** {@inheritDoc} */

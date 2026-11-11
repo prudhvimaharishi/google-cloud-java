@@ -29,6 +29,9 @@
  */
 package com.google.api.gax.grpc;
 
+import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutures;
+import com.google.api.core.InternalApi;
 import com.google.api.core.InternalExtensionOnly;
 import com.google.api.gax.core.ResourceCloseException;
 import com.google.api.gax.rpc.TransportChannel;
@@ -37,6 +40,7 @@ import io.grpc.Channel;
 import io.grpc.ManagedChannel;
 import java.util.concurrent.TimeUnit;
 import org.jspecify.annotations.NullMarked;
+import org.jspecify.annotations.Nullable;
 
 /** Implementation of TransportChannel based on gRPC. */
 @NullMarked
@@ -62,10 +66,34 @@ public abstract class GrpcTransportChannel implements TransportChannel {
   /** The channel in use. */
   abstract ManagedChannel getManagedChannel();
 
+  abstract @Nullable ChannelWarmUp getChannelWarmUp();
+
   public abstract boolean isDirectPath();
 
   public Channel getChannel() {
     return getManagedChannel();
+  }
+
+  /** Initiates channel connections and credential token prefetching without blocking. */
+  @InternalApi("For internal use by google-cloud-java clients only")
+  public void startWarmUp() {
+    ChannelWarmUp warmUp = getChannelWarmUp();
+    if (warmUp != null) {
+      warmUp.startInBackground();
+    }
+  }
+
+  /**
+   * Warms the transport channels and active credentials, returning a future that completes when
+   * both are ready.
+   */
+  @InternalApi("For internal use by google-cloud-java clients only")
+  public ApiFuture<Void> warmUp() {
+    ChannelWarmUp warmUp = getChannelWarmUp();
+    if (warmUp != null) {
+      return warmUp.warmUp();
+    }
+    return ApiFutures.immediateFuture(null);
   }
 
   @Override
@@ -140,6 +168,8 @@ public abstract class GrpcTransportChannel implements TransportChannel {
   @AutoValue.Builder
   public abstract static class Builder {
     public abstract Builder setManagedChannel(ManagedChannel value);
+
+    abstract Builder setChannelWarmUp(@Nullable ChannelWarmUp value);
 
     abstract Builder setDirectPath(boolean value);
 

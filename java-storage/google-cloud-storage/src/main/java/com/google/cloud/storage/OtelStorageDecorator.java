@@ -19,8 +19,10 @@ package com.google.cloud.storage;
 import static java.util.Objects.requireNonNull;
 
 import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutureCallback;
 import com.google.api.core.ApiFutures;
 import com.google.api.core.BetaApi;
+import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.paging.Page;
 import com.google.cloud.Policy;
 import com.google.cloud.ReadChannel;
@@ -1539,6 +1541,61 @@ final class OtelStorageDecorator implements Storage {
   @Override
   public StorageOptions getOptions() {
     return delegate.getOptions();
+  }
+
+  @Override
+  @BetaApi
+  public ApiFuture<Void> warmUp() {
+    Span span = tracer.spanBuilder("warmUp").setAttribute("gsutil.uri", "gs://").startSpan();
+    return traceWarmUpFuture(span, () -> delegate.warmUp());
+  }
+
+  @Override
+  @BetaApi
+  public ApiFuture<Void> warmUp(String bucket, BucketSourceOption... options) {
+    String uri = bucket != null && !bucket.isEmpty() ? fmtBucket(bucket) : "gs://";
+    Span span = tracer.spanBuilder("warmUp").setAttribute("gsutil.uri", uri).startSpan();
+    return traceWarmUpFuture(span, () -> delegate.warmUp(bucket, options));
+  }
+
+  private static ApiFuture<Void> traceWarmUpFuture(
+      Span span, java.util.function.Supplier<ApiFuture<Void>> supplier) {
+    try (Scope ignore = span.makeCurrent()) {
+      ApiFuture<Void> future = supplier.get();
+      SettableApiFuture<Void> tracedFuture = SettableApiFuture.create();
+      tracedFuture.addListener(
+          () -> {
+            if (tracedFuture.isCancelled()) {
+              future.cancel(true);
+            }
+          },
+          MoreExecutors.directExecutor());
+      ApiFutures.addCallback(
+          future,
+          new ApiFutureCallback<Void>() {
+            @Override
+            public void onSuccess(Void result) {
+              span.setStatus(StatusCode.OK);
+              span.end();
+              tracedFuture.set(result);
+            }
+
+            @Override
+            public void onFailure(Throwable t) {
+              span.recordException(t);
+              span.setStatus(StatusCode.ERROR, t.getClass().getSimpleName());
+              span.end();
+              tracedFuture.setException(t);
+            }
+          },
+          MoreExecutors.directExecutor());
+      return tracedFuture;
+    } catch (Throwable t) {
+      span.recordException(t);
+      span.setStatus(StatusCode.ERROR, t.getClass().getSimpleName());
+      span.end();
+      throw t;
+    }
   }
 
   static Storage decorate(Storage delegate, OpenTelemetry otel, Transport transport) {

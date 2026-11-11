@@ -19,28 +19,50 @@ package com.google.cloud.storage;
 import static com.google.common.base.Preconditions.checkArgument;
 
 import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutureCallback;
 import com.google.api.core.ApiFutures;
 import com.google.api.core.InternalApi;
+import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.grpc.GrpcCallContext;
+import com.google.api.gax.grpc.GrpcStatusCode;
+import com.google.api.gax.rpc.ApiExceptionFactory;
+import com.google.api.gax.rpc.NotFoundException;
+import com.google.cloud.BaseServiceException;
 import com.google.cloud.storage.GrpcUtils.ZeroCopyBidiStreamingCallable;
 import com.google.cloud.storage.ObjectReadSessionState.OpenArguments;
 import com.google.cloud.storage.ReadProjectionConfig.ProjectionType;
 import com.google.cloud.storage.RetryContext.RetryContextProvider;
+import com.google.common.util.concurrent.MoreExecutors;
 import com.google.storage.v2.BidiReadObjectRequest;
 import com.google.storage.v2.BidiReadObjectResponse;
+import io.grpc.Status;
+import io.grpc.Status.Code;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @InternalApi
 final class StorageDataClient implements AutoCloseable {
+
+  static final String WARMUP_NONEXISTENT_OBJECT = "__gcs_sdk_warmup_nonexistent_object__";
+  static final long WARMUP_OBJECT_GENERATION = 1L;
+  static final Duration MAX_WARMUP_TIMEOUT = Duration.ofSeconds(15);
+
+  enum WarmUpProbeOutcome {
+    NOT_FOUND,
+    OK
+  }
 
   final ScheduledExecutorService executor;
   private final Duration terminationAwaitDuration;
   private final ZeroCopyBidiStreamingCallable<BidiReadObjectRequest, BidiReadObjectResponse>
       bidiReadObject;
   final RetryContextProvider retryContextProvider;
+  private final RetryContextProvider warmUpRetryContextProvider;
+  private final Duration warmUpTimeout;
   private final IOAutoCloseable onClose;
 
   private StorageDataClient(
@@ -48,11 +70,15 @@ final class StorageDataClient implements AutoCloseable {
       Duration terminationAwaitDuration,
       ZeroCopyBidiStreamingCallable<BidiReadObjectRequest, BidiReadObjectResponse> bidiReadObject,
       RetryContextProvider retryContextProvider,
+      RetryContextProvider warmUpRetryContextProvider,
+      Duration warmUpTimeout,
       IOAutoCloseable onClose) {
     this.executor = executor;
     this.terminationAwaitDuration = terminationAwaitDuration;
     this.bidiReadObject = bidiReadObject;
     this.retryContextProvider = retryContextProvider;
+    this.warmUpRetryContextProvider = warmUpRetryContextProvider;
+    this.warmUpTimeout = warmUpTimeout;
     this.onClose = onClose;
   }
 
@@ -117,6 +143,86 @@ final class StorageDataClient implements AutoCloseable {
     return objectReadSessionFuture;
   }
 
+  ApiFuture<WarmUpProbeOutcome> warmUp(BidiReadObjectRequest req, GrpcCallContext ctx) {
+    checkArgument(
+        req.getReadRangesList().isEmpty(),
+        "ranges included in the warm-up request are not supported");
+    ObjectReadSessionState state = new ObjectReadSessionState(ctx, req);
+    ZeroCopyBidiStreamingCallable<BidiReadObjectRequest, BidiReadObjectResponse> callable =
+        getCallable();
+    ObjectReadSessionStream stream =
+        ObjectReadSessionStream.create(
+            executor, callable, state, warmUpRetryContextProvider.create());
+
+    SettableApiFuture<WarmUpProbeOutcome> resultFuture = SettableApiFuture.create();
+    ScheduledFuture<?> timeoutTask =
+        executor.schedule(
+            () -> {
+              BaseServiceException timeoutError =
+                  StorageException.coalesce(
+                      ApiExceptionFactory.createException(
+                          "Warm-up probe timed out after " + warmUpTimeout,
+                          new TimeoutException("Warm-up probe timed out after " + warmUpTimeout),
+                          GrpcStatusCode.of(Code.DEADLINE_EXCEEDED),
+                          false));
+              if (resultFuture.setException(timeoutError)) {
+                stream.closeAsync();
+              }
+            },
+            warmUpTimeout.toNanos(),
+            TimeUnit.NANOSECONDS);
+
+    resultFuture.addListener(
+        () -> {
+          timeoutTask.cancel(false);
+          if (resultFuture.isCancelled()) {
+            executor.execute(stream::closeAsync);
+          }
+        },
+        MoreExecutors.directExecutor());
+
+    ApiFutures.addCallback(
+        stream,
+        new ApiFutureCallback<Void>() {
+          @Override
+          public void onSuccess(Void nowOpen) {
+            timeoutTask.cancel(false);
+            ApiFuture<Void> closeFuture = stream.closeAsync();
+            closeFuture.addListener(
+                () -> resultFuture.set(WarmUpProbeOutcome.OK), MoreExecutors.directExecutor());
+          }
+
+          @Override
+          public void onFailure(Throwable t) {
+            timeoutTask.cancel(false);
+            if (isNotFound(t)) {
+              resultFuture.set(WarmUpProbeOutcome.NOT_FOUND);
+            } else {
+              resultFuture.setException(StorageException.coalesce(t));
+            }
+          }
+        },
+        executor);
+
+    try {
+      stream.send(req);
+    } catch (Throwable t) {
+      timeoutTask.cancel(false);
+      resultFuture.setException(StorageException.coalesce(t));
+    }
+    return resultFuture;
+  }
+
+  private static boolean isNotFound(Throwable t) {
+    if (t instanceof NotFoundException) {
+      return true;
+    }
+    if (t instanceof StorageException && ((StorageException) t).getCode() == 404) {
+      return true;
+    }
+    return Status.fromThrowable(t).getCode() == Code.NOT_FOUND;
+  }
+
   @SuppressWarnings("ResultOfMethodCallIgnored")
   @Override
   public void close() throws Exception {
@@ -139,8 +245,32 @@ final class StorageDataClient implements AutoCloseable {
       ZeroCopyBidiStreamingCallable<BidiReadObjectRequest, BidiReadObjectResponse> read,
       RetryContextProvider retryContextProvider,
       IOAutoCloseable onClose) {
+    return create(
+        executor,
+        terminationAwaitDuration,
+        read,
+        retryContextProvider,
+        retryContextProvider,
+        MAX_WARMUP_TIMEOUT,
+        onClose);
+  }
+
+  static StorageDataClient create(
+      ScheduledExecutorService executor,
+      Duration terminationAwaitDuration,
+      ZeroCopyBidiStreamingCallable<BidiReadObjectRequest, BidiReadObjectResponse> read,
+      RetryContextProvider retryContextProvider,
+      RetryContextProvider warmUpRetryContextProvider,
+      Duration warmUpTimeout,
+      IOAutoCloseable onClose) {
     return new StorageDataClient(
-        executor, terminationAwaitDuration, read, retryContextProvider, onClose);
+        executor,
+        terminationAwaitDuration,
+        read,
+        retryContextProvider,
+        warmUpRetryContextProvider,
+        warmUpTimeout,
+        onClose);
   }
 
   @FunctionalInterface

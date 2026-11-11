@@ -23,6 +23,7 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import static java.util.Objects.requireNonNull;
 
 import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutures;
 import com.google.api.core.BetaApi;
 import com.google.api.core.InternalApi;
 import com.google.api.core.InternalExtensionOnly;
@@ -6004,5 +6005,58 @@ public interface Storage extends Service<StorageOptions>, AutoCloseable {
       BlobInfo blobInfo, BlobAppendableUploadConfig uploadConfig, BlobWriteOption... options) {
     return throwGrpcOnly(
         fmtMethodName("appendableBlobUpload", BlobId.class, BlobWriteOption.class));
+  }
+
+  /**
+   * Warms the client's transport channels and authentication credentials in the background without
+   * targeting a specific bucket.
+   *
+   * <p>On HTTP transport clients, this method is a no-op and returns an immediately completed
+   * future.
+   *
+   * @return a future that completes when transport channels are ready and credentials are
+   *     prefetched, or fails with a {@link StorageException}
+   */
+  @BetaApi
+  @TransportCompatibility({Transport.HTTP, Transport.GRPC})
+  default ApiFuture<Void> warmUp() {
+    return ApiFutures.immediateFuture(null);
+  }
+
+  /**
+   * Warms the client's transport channels, authentication credentials, and data-plane routing path
+   * for the specified {@code bucket}.
+   *
+   * <p>On gRPC transport clients, this method performs a best-effort, non-mutating read probe
+   * against {@code bucket} so that transport setup, authentication, and bucket routing complete
+   * before application reads begin.
+   *
+   * <p>Operational notes:
+   *
+   * <ul>
+   *   <li>Requires {@code storage.objects.get} permission on {@code bucket} without object-prefix
+   *       IAM conditions.
+   *   <li>May incur Class B read operation charges and produce Data Access audit log entries if
+   *       Data Read audit logging is enabled on {@code bucket}.
+   *   <li>Success does not imply that {@code bucket} exists; do not use this method as a bucket
+   *       existence check.
+   *   <li>Supports {@link BucketSourceOption#userProject(String)} for Requester Pays buckets.
+   *   <li>On HTTP transport clients, this method validates {@code bucket} and returns an
+   *       immediately completed future without network I/O.
+   * </ul>
+   *
+   * @param bucket non-empty name of the target bucket to warm
+   * @param options optional bucket source options such as {@link
+   *     BucketSourceOption#userProject(String)}
+   * @return a future that completes when the warm-up finishes, or fails with a {@link
+   *     StorageException} on authentication, permission, or transport failure
+   */
+  @BetaApi
+  @TransportCompatibility({Transport.HTTP, Transport.GRPC})
+  default ApiFuture<Void> warmUp(String bucket, BucketSourceOption... options) {
+    requireNonNull(bucket, "bucket must be non null");
+    checkArgument(!bucket.isEmpty(), "bucket must be non-empty");
+    requireNonNull(options, "options must be non null");
+    return ApiFutures.immediateFuture(null);
   }
 }

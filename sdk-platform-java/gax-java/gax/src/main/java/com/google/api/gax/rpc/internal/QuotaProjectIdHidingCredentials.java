@@ -31,11 +31,13 @@ package com.google.api.gax.rpc.internal;
 
 import com.google.api.client.util.Beta;
 import com.google.auth.Credentials;
+import com.google.auth.RequestMetadataCallback;
 import com.google.common.collect.ImmutableMap;
 import java.io.IOException;
 import java.net.URI;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
 import org.jspecify.annotations.NullMarked;
 import org.jspecify.annotations.Nullable;
 
@@ -62,10 +64,33 @@ public class QuotaProjectIdHidingCredentials extends Credentials {
 
   @Override
   public Map<String, List<String>> getRequestMetadata(@Nullable URI uri) throws IOException {
+    return stripQuotaProjectHeader(this.wrappedCredentials.getRequestMetadata(uri));
+  }
+
+  @Override
+  public void getRequestMetadata(
+      @Nullable URI uri, Executor executor, RequestMetadataCallback callback) {
+    this.wrappedCredentials.getRequestMetadata(
+        uri,
+        executor,
+        new RequestMetadataCallback() {
+          @Override
+          public void onSuccess(Map<String, List<String>> metadata) {
+            callback.onSuccess(stripQuotaProjectHeader(metadata));
+          }
+
+          @Override
+          public void onFailure(Throwable exception) {
+            callback.onFailure(exception);
+          }
+        });
+  }
+
+  private static Map<String, List<String>> stripQuotaProjectHeader(
+      Map<String, List<String>> metadata) {
     ImmutableMap.Builder<String, List<String>> metaBuilder = ImmutableMap.builder();
-    for (Map.Entry<String, List<String>> entry :
-        this.wrappedCredentials.getRequestMetadata(uri).entrySet()) {
-      if (entry.getKey().equals(QUOTA_PROJECT_ID_HEADER_KEY)) {
+    for (Map.Entry<String, List<String>> entry : metadata.entrySet()) {
+      if (entry.getKey().equalsIgnoreCase(QUOTA_PROJECT_ID_HEADER_KEY)) {
         continue;
       }
       metaBuilder.put(entry);

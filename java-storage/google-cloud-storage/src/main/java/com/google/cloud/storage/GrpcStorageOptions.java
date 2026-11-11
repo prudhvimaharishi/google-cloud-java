@@ -45,10 +45,12 @@ import com.google.api.gax.rpc.OutOfRangeException;
 import com.google.api.gax.rpc.RequestParamsBuilder;
 import com.google.api.gax.rpc.RequestParamsExtractor;
 import com.google.api.gax.rpc.ServerStreamingCallable;
+import com.google.api.gax.rpc.TransportChannel;
 import com.google.api.gax.rpc.internal.QuotaProjectIdHidingCredentials;
 import com.google.api.gax.tracing.ApiTracerFactory;
 import com.google.api.pathtemplate.PathTemplate;
 import com.google.auth.Credentials;
+import com.google.auth.oauth2.QuotaProjectIdProvider;
 import com.google.cloud.NoCredentials;
 import com.google.cloud.ServiceFactory;
 import com.google.cloud.ServiceOptions;
@@ -117,7 +119,6 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
@@ -145,6 +146,8 @@ public final class GrpcStorageOptions extends StorageOptions
   private final java.time.Duration terminationAwaitDuration;
   private final boolean attemptDirectPath;
   private final boolean attemptDirectPathXdsOverInterconnect;
+  private final @Nullable Boolean rawWarmUpOnCreationEnabled;
+  private final boolean warmUpOnCreationEnabled;
   private final boolean enableGrpcClientMetrics;
 
   private final boolean grpcClientMetricsManuallyEnabled;
@@ -164,6 +167,9 @@ public final class GrpcStorageOptions extends StorageOptions
             serviceDefaults.getTerminationAwaitDurationJavaTime());
     this.attemptDirectPath = builder.attemptDirectPath;
     this.attemptDirectPathXdsOverInterconnect = builder.attemptDirectPathXdsOverInterconnect;
+    this.rawWarmUpOnCreationEnabled = builder.warmUpOnCreationEnabled;
+    this.warmUpOnCreationEnabled =
+        StorageWarmUpConfig.isWarmUpOnCreationEnabled(builder.warmUpOnCreationEnabled);
     this.enableGrpcClientMetrics = builder.enableGrpcClientMetrics;
     this.grpcClientMetricsManuallyEnabled = builder.grpcMetricsManuallyEnabled;
     this.grpcInterceptorProvider = builder.grpcInterceptorProvider;
@@ -254,32 +260,12 @@ public final class GrpcStorageOptions extends StorageOptions
     if (credentials instanceof NoCredentials) {
       credentialsProvider = NoCredentialsProvider.create();
     } else {
-      boolean foundQuotaProject = false;
-      if (credentials.hasRequestMetadata()) {
-        try {
-          Map<String, List<String>> requestMetadata = credentials.getRequestMetadata(uri);
-          for (Entry<String, List<String>> e : requestMetadata.entrySet()) {
-            String key = e.getKey();
-            if ("x-goog-user-project".equals(Utils.headerNameToLowerCase(key.trim()))) {
-              List<String> value = e.getValue();
-              if (!value.isEmpty()) {
-                foundQuotaProject = true;
-                defaultOpts = Opts.from(UnifiedOpts.userProject(value.get(0)));
-                break;
-              }
-            }
-          }
-        } catch (IllegalStateException e) {
-          // This happens when an instance of OAuth2Credentials attempts to refresh its
-          // access token during our attempt at getting request metadata.
-          // This is most easily reproduced by OAuth2Credentials.create(null);
-          // see com.google.auth.oauth2.OAuth2Credentials.refreshAccessToken
-          if (!e.getMessage().startsWith("OAuth2Credentials")) {
-            throw e;
-          }
-        }
-      }
-      if (foundQuotaProject) {
+      String credsQuotaProjectId =
+          credentials instanceof QuotaProjectIdProvider
+              ? ((QuotaProjectIdProvider) credentials).getQuotaProjectId()
+              : null;
+      if (credsQuotaProjectId != null && !credsQuotaProjectId.isEmpty()) {
+        defaultOpts = Opts.from(UnifiedOpts.userProject(credsQuotaProjectId));
         // fix for https://github.com/googleapis/java-storage/issues/1736
         credentialsProvider =
             FixedCredentialsProvider.create(new QuotaProjectIdHidingCredentials(credentials));
@@ -327,7 +313,8 @@ public final class GrpcStorageOptions extends StorageOptions
             .setEndpoint(endpoint)
             .setAllowNonDefaultServiceAccount(true)
             .setAttemptDirectPath(attemptDirectPath || attemptDirectPathXdsOverInterconnect)
-            .setAttemptDirectPathXdsOverInterconnect(attemptDirectPathXdsOverInterconnect);
+            .setAttemptDirectPathXdsOverInterconnect(attemptDirectPathXdsOverInterconnect)
+            .setWarmUpOnCreation(warmUpOnCreationEnabled);
 
     if (!DIRECT_PATH_BOUND_TOKEN_DISABLED) {
       channelProviderBuilder.setAllowHardBoundTokenTypes(
@@ -411,6 +398,15 @@ public final class GrpcStorageOptions extends StorageOptions
   }
 
   /**
+   * Whether background channel connection and credential token prefetching run automatically when
+   * creating a client.
+   */
+  @BetaApi
+  public boolean isWarmUpOnCreationEnabled() {
+    return warmUpOnCreationEnabled;
+  }
+
+  /**
    * @since 2.47.0 This new api is in preview and is subject to breaking changes.
    */
   @BetaApi
@@ -434,6 +430,7 @@ public final class GrpcStorageOptions extends StorageOptions
         terminationAwaitDuration,
         attemptDirectPath,
         attemptDirectPathXdsOverInterconnect,
+        warmUpOnCreationEnabled,
         enableGrpcClientMetrics,
         grpcInterceptorProvider,
         blobWriteSessionConfig,
@@ -456,6 +453,7 @@ public final class GrpcStorageOptions extends StorageOptions
     GrpcStorageOptions that = (GrpcStorageOptions) o;
     return attemptDirectPath == that.attemptDirectPath
         && attemptDirectPathXdsOverInterconnect == that.attemptDirectPathXdsOverInterconnect
+        && warmUpOnCreationEnabled == that.warmUpOnCreationEnabled
         && enableGrpcClientMetrics == that.enableGrpcClientMetrics
         && isEnableOtelMetrics() == that.isEnableOtelMetrics()
         && isEnableOtelDebugMetrics() == that.isEnableOtelDebugMetrics()
@@ -510,6 +508,7 @@ public final class GrpcStorageOptions extends StorageOptions
     private java.time.Duration terminationAwaitDuration;
     private boolean attemptDirectPath = GrpcStorageDefaults.INSTANCE.isAttemptDirectPath();
     private boolean attemptDirectPathXdsOverInterconnect = false;
+    private @Nullable Boolean warmUpOnCreationEnabled = null;
     private boolean enableGrpcClientMetrics =
         GrpcStorageDefaults.INSTANCE.isEnableGrpcClientMetrics();
     private GrpcInterceptorProvider grpcInterceptorProvider =
@@ -529,6 +528,7 @@ public final class GrpcStorageOptions extends StorageOptions
       this.terminationAwaitDuration = gso.getTerminationAwaitDuration();
       this.attemptDirectPath = gso.attemptDirectPath;
       this.attemptDirectPathXdsOverInterconnect = gso.attemptDirectPathXdsOverInterconnect;
+      this.warmUpOnCreationEnabled = gso.rawWarmUpOnCreationEnabled;
       this.enableGrpcClientMetrics = gso.enableGrpcClientMetrics;
       this.grpcInterceptorProvider = gso.grpcInterceptorProvider;
       this.blobWriteSessionConfig = gso.blobWriteSessionConfig;
@@ -587,6 +587,20 @@ public final class GrpcStorageOptions extends StorageOptions
     public GrpcStorageOptions.Builder setAttemptDirectPathXdsOverInterconnect(
         boolean attemptDirectPathXdsOverInterconnect) {
       this.attemptDirectPathXdsOverInterconnect = attemptDirectPathXdsOverInterconnect;
+      return this;
+    }
+
+    /**
+     * Enables or disables background channel connection and credential token prefetching when the
+     * client is created. Disabled ({@code false}) by default.
+     *
+     * <p>When unset on the builder, this setting can also be controlled with the {@code
+     * com.google.cloud.storage.grpc.warmup_on_creation} Java system property or the {@code
+     * GCP_STORAGE_JAVA_ENABLE_WARMUP_ON_CREATION} environment variable.
+     */
+    @BetaApi
+    public GrpcStorageOptions.Builder setWarmUpOnCreationEnabled(boolean warmUpOnCreationEnabled) {
+      this.warmUpOnCreationEnabled = warmUpOnCreationEnabled;
       return this;
     }
 
@@ -998,12 +1012,29 @@ public final class GrpcStorageOptions extends StorageOptions
 
           ScheduledExecutorService executor =
               storageSettings.getBackgroundExecutorProvider().getExecutor();
+          ResultRetryAlgorithm<?> dataRetryAlgorithm =
+              new ReadObjectRangeResultRetryAlgorithmDecorator(
+                  grpcStorageOptions.getRetryAlgorithmManager().idempotent());
           RetryContextProvider retryContextProvider =
+              RetryContext.providerFrom(executor, grpcStorageOptions, dataRetryAlgorithm);
+          Duration configuredTotalTimeout =
+              grpcStorageOptions.getRetrySettings().getTotalTimeoutDuration();
+          Duration warmUpTimeout =
+              configuredTotalTimeout != null
+                      && !configuredTotalTimeout.isZero()
+                      && configuredTotalTimeout.compareTo(StorageDataClient.MAX_WARMUP_TIMEOUT) < 0
+                  ? configuredTotalTimeout
+                  : StorageDataClient.MAX_WARMUP_TIMEOUT;
+          RetrySettings warmUpRetrySettings =
+              grpcStorageOptions.getRetrySettings().toBuilder()
+                  .setLogicalTimeout(warmUpTimeout)
+                  .build();
+          RetryContextProvider warmUpRetryContextProvider =
               RetryContext.providerFrom(
                   executor,
-                  grpcStorageOptions,
-                  new ReadObjectRangeResultRetryAlgorithmDecorator(
-                      grpcStorageOptions.getRetryAlgorithmManager().idempotent()));
+                  Retrying.RetryingDependencies.simple(
+                      grpcStorageOptions.getClock(), warmUpRetrySettings),
+                  dataRetryAlgorithm);
 
           OpenTelemetry otel = options.getOpenTelemetry();
           DefaultRetrier retrier =
@@ -1029,6 +1060,8 @@ public final class GrpcStorageOptions extends StorageOptions
                     new ZeroCopyBidiStreamingCallable<>(
                         stub.bidiReadObjectCallable(), stub.bidiReadObjectResponseMarshaller),
                     retryContextProvider,
+                    warmUpRetryContextProvider,
+                    warmUpTimeout,
                     IOAutoCloseable.noOp());
             GrpcStorageImpl grpcStorage =
                 new GrpcStorageImpl(
@@ -1038,12 +1071,22 @@ public final class GrpcStorageOptions extends StorageOptions
                     stub.readObjectResponseMarshaller,
                     grpcStorageOptions.blobWriteSessionConfig.createFactory(Clock.systemUTC()),
                     retrier,
-                    defaultOpts);
+                    defaultOpts,
+                    stub.transportChannel);
             return OtelStorageDecorator.decorate(grpcStorage, otel, Transport.GRPC);
           } else {
             LOGGER.config(
                 "zero-copy protobuf deserialization unavailable, proceeding with default");
-            StorageClient client = StorageClient.create(storageSettings);
+            StorageStubSettings baseSettings =
+                (StorageStubSettings) storageSettings.getStubSettings();
+            ClientContext clientContext = ClientContext.create(baseSettings);
+            TransportChannel rawTransportChannel = clientContext.getTransportChannel();
+            GrpcTransportChannel transportChannel =
+                rawTransportChannel instanceof GrpcTransportChannel
+                    ? (GrpcTransportChannel) rawTransportChannel
+                    : null;
+            StorageStub stub = new GrpcStorageStub(baseSettings, clientContext) {};
+            StorageClient client = StorageClient.create(stub);
             StorageDataClient dataClient =
                 StorageDataClient.create(
                     executor,
@@ -1052,6 +1095,8 @@ public final class GrpcStorageOptions extends StorageOptions
                         client.bidiReadObjectCallable(),
                         ResponseContentLifecycleManager.noopBidiReadObjectResponse()),
                     retryContextProvider,
+                    warmUpRetryContextProvider,
+                    warmUpTimeout,
                     IOAutoCloseable.noOp());
             GrpcStorageImpl grpcStorage =
                 new GrpcStorageImpl(
@@ -1061,7 +1106,8 @@ public final class GrpcStorageOptions extends StorageOptions
                     ResponseContentLifecycleManager.noop(),
                     grpcStorageOptions.blobWriteSessionConfig.createFactory(Clock.systemUTC()),
                     retrier,
-                    defaultOpts);
+                    defaultOpts,
+                    transportChannel);
             return OtelStorageDecorator.decorate(grpcStorage, otel, Transport.GRPC);
           }
         } catch (IOException e) {
@@ -1248,6 +1294,7 @@ public final class GrpcStorageOptions extends StorageOptions
     private final ZeroCopyResponseMarshaller<ReadObjectResponse> readObjectResponseMarshaller;
     private final ZeroCopyResponseMarshaller<BidiReadObjectResponse>
         bidiReadObjectResponseMarshaller;
+    private final @Nullable GrpcTransportChannel transportChannel;
 
     private final ServerStreamingCallable<ReadObjectRequest, ReadObjectResponse> readObjectCallable;
     private final BidiStreamingCallable<BidiReadObjectRequest, BidiReadObjectResponse>
@@ -1259,6 +1306,11 @@ public final class GrpcStorageOptions extends StorageOptions
         GrpcStubCallableFactory callableFactory)
         throws IOException {
       super(settings, clientContext, callableFactory);
+      TransportChannel rawTransportChannel = clientContext.getTransportChannel();
+      this.transportChannel =
+          rawTransportChannel instanceof GrpcTransportChannel
+              ? (GrpcTransportChannel) rawTransportChannel
+              : null;
 
       this.readObjectResponseMarshaller =
           new ZeroCopyResponseMarshaller<>(ReadObjectResponse.getDefaultInstance());

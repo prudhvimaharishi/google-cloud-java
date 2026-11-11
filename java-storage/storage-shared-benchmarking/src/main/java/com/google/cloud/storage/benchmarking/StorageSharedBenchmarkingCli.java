@@ -91,6 +91,35 @@ public final class StorageSharedBenchmarkingCli implements Runnable {
   @Option(names = "-bidi_enabled", description = "If bidi should be enabled")
   boolean bidiEnabled;
 
+  @Option(
+      names = "-warmup_mode",
+      defaultValue = "none",
+      description = "Warm-up mode: none, tier1, tier2-bucketless, or tier2-bucket")
+  String warmUpMode;
+
+  @Option(
+      names = "-warmup_object",
+      defaultValue = "warmup-bench/obj-64KiB",
+      description = "Object name to read during warmup-cold-start benchmark")
+  String warmUpObject;
+
+  @Option(
+      names = "-warmup_probe_bucket",
+      description = "Optional bucket name for warmUp(bucket) in cross-bucket tests")
+  String warmUpProbeBucket;
+
+  @Option(
+      names = "-tier1_enabled",
+      defaultValue = "false",
+      description = "Whether setWarmUpOnCreationEnabled(true) is set on GrpcStorageOptions")
+  boolean tier1Enabled;
+
+  @Option(
+      names = "-tier1_delay_ms",
+      defaultValue = "0",
+      description = "Delay in milliseconds between client creation and warmup/first read")
+  long tier1DelayMs;
+
   Path tempDir;
 
   PrintWriter printWriter;
@@ -114,8 +143,38 @@ public final class StorageSharedBenchmarkingCli implements Runnable {
       case "write-only":
         runWorkloadWriteOnly();
         break;
+      case "warmup-cold-start":
+        runWarmUpColdStart();
+        break;
       default:
         throw new IllegalStateException("Specify a workload to run");
+    }
+  }
+
+  private void runWarmUpColdStart() {
+    try {
+      int readBytes =
+          objectSize.contains("..")
+              ? Range.of(objectSize).min
+              : Integer.parseInt(objectSize.trim());
+      new WarmUpColdStartProber(
+              project,
+              bucket,
+              warmUpProbeBucket,
+              warmUpObject,
+              readBytes,
+              api,
+              warmUpMode,
+              tier1Enabled,
+              tier1DelayMs,
+              workers,
+              samples,
+              printWriter)
+          .execute();
+    } catch (Exception e) {
+      System.err.println("Failed to run warmup-cold-start: " + e.getMessage());
+      e.printStackTrace(System.err);
+      System.exit(1);
     }
   }
 
